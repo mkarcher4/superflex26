@@ -30,6 +30,7 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-variant-numeric: tabular-nums;
     min-height: 100vh;
+    overflow-x: hidden;
   }
   .wrap { max-width: 1140px; margin: 0 auto; padding: 28px 20px 80px; }
 
@@ -86,8 +87,15 @@
     gap: 2px;
     margin-bottom: 22px;
     border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
   }
+  nav.tabs::-webkit-scrollbar { display: none; }
   nav.tabs button {
+    flex: 0 0 auto;
     background: none;
     border: none;
     color: var(--text-muted);
@@ -145,6 +153,16 @@
     padding: 7px 10px;
     border-radius: 6px;
     font-size: 14px;
+  }
+  .filter-row { display: flex; align-items: center; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+  .filter-row label { font-size: 12px; color: var(--text-muted); display: flex; flex-direction: column; gap: 4px; }
+  .filter-row select, .filter-row input[type="date"] {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 13.5px;
   }
   .matchup-grid { display: grid; gap: 10px; }
   .matchup-card {
@@ -226,9 +244,19 @@
   .compact-grid table th, .compact-grid table td { font-size: 12.5px; padding: 6px 8px; }
   .compact-label { font-size: 12.5px; font-weight: 700; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
 
+  /* Playoff Bracket rounds */
+  .bracket-round { margin-bottom: 22px; }
+  .bracket-round-label { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--gold); margin: 0 0 10px; font-weight: 700; }
+
   /* Tight, dense table (Weekly Scoring — many week columns) */
   .tight-table th, .tight-table td { font-size: 12px; padding: 5px 7px; white-space: nowrap; }
   .tight-table td.team, .tight-table th:first-child { white-space: normal; }
+
+  /* Narrow table (Free Agent Budget Summary) -- content-width instead of
+     stretching to fill the card, so a 3-column table doesn't look sparse */
+  .narrow-table { table-layout: auto; width: auto; }
+  .narrow-table td, .narrow-table th { white-space: nowrap; padding-right: 22px; }
+  .narrow-table td:last-child, .narrow-table th:last-child { padding-right: 8px; }
 </style>
 </head>
 <body>
@@ -253,12 +281,18 @@
       <button data-tab="matchups">Matchups</button>
       <button data-tab="boxscore">Box Score</button>
       <button data-tab="teamcompare">Team Comparison</button>
+      <button data-tab="draftrecap">Draft Recap</button>
+      <button data-tab="waivers">Waivers</button>
+      <button data-tab="playoffs">Playoff Bracket</button>
     </nav>
 
     <div id="view-standings" class="view active"></div>
     <div id="view-matchups" class="view"></div>
     <div id="view-boxscore" class="view"></div>
     <div id="view-teamcompare" class="view"></div>
+    <div id="view-draftrecap" class="view"></div>
+    <div id="view-waivers" class="view"></div>
+    <div id="view-playoffs" class="view"></div>
   </div>
 </div>
 
@@ -268,7 +302,10 @@ const WEEKLY_PRIZE = 20;
 const FIRST_PLACE_PRIZE = 600;
 const SECOND_PLACE_PRIZE = 264;
 
-let LEAGUE = null;   // raw loaded JSON
+let LEAGUE = null;   // raw loaded JSON for the CURRENTLY SELECTED season
+let ALL_SEASONS = {}; // season (string) -> that season's league data, same shape LEAGUE used to be
+let AVAILABLE_SEASONS = []; // sorted descending, e.g. [2026, 2025]
+let CURRENT_SEASON = null;
 let TEAMS = {};      // id -> team object
 let WEEKLY = {};      // week -> [{teamId, points}]
 let MATCHUPS_BY_WEEK = {}; // week -> [{home, away, homeScore, awayScore, homeId, awayId}]
@@ -319,54 +356,118 @@ function teamName(t) {
 
 function loadLeague(data) {
   try {
-    LEAGUE = data;
-    TEAMS = {};
-    (data.teams || []).forEach(t => { TEAMS[t.id] = t; });
-
-    buildWeeklyAndMatchups(data);
-
-    document.getElementById('leagueTitle').textContent = data.leagueName || 'League Tracker';
-    document.getElementById('leagueMeta').textContent =
-      (data.season || '') + ' Season · ' + Object.keys(TEAMS).length + ' Teams · Through Week ' + (data.currentWeek || '?');
+    // Back-compat: older synced JSON (pre-multi-season) is a flat single
+    // season object at the root, with no "seasons" key. Wrap it into the
+    // same shape as the new format so everything downstream can assume
+    // multi-season structure without special-casing it.
+    if (data && data.seasons) {
+      ALL_SEASONS = data.seasons;
+      AVAILABLE_SEASONS = (data.availableSeasons && data.availableSeasons.length)
+        ? data.availableSeasons
+        : Object.keys(data.seasons).map(Number).sort((a, b) => b - a);
+    } else if (data && data.season) {
+      ALL_SEASONS = { [String(data.season)]: data };
+      AVAILABLE_SEASONS = [data.season];
+    } else {
+      throw new Error('Unrecognized league_data.json format');
+    }
 
     document.getElementById('loaderCard').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     document.getElementById('headerSyncBtn').style.display = 'inline-block';
 
-    renderStandings();
-    renderMatchupsTab();
+    activateSeason(AVAILABLE_SEASONS[0]);
   } catch (err) {
     document.getElementById('loadErr').textContent = 'Error reading league data: ' + err.message;
   }
 }
 
+// Switches the whole app to a different season's data. Every tab reads from
+// the TEAMS/WEEKLY/MATCHUPS_BY_WEEK/LEAGUE globals, so once those are
+// swapped and season-scoped caches are cleared, re-rendering the currently
+// visible tab (and pre-rendering Matchups, matching the original eager-load
+// behavior) is all that's needed -- no other tab-specific code has to know
+// seasons exist.
+function activateSeason(season) {
+  CURRENT_SEASON = season;
+  LEAGUE = ALL_SEASONS[String(season)];
+  if (!LEAGUE) return;
+
+  TEAMS = {};
+  (LEAGUE.teams || []).forEach(t => { TEAMS[t.id] = t; });
+
+  buildWeeklyAndMatchups(LEAGUE);
+
+  // Season-scoped caches/state that must not leak between seasons
+  draftPlayerInfoCache = null;
+  draftRecapFilters = { team: 'all', pos: 'all' };
+  draftRecapAllPicks = [];
+  document.getElementById('view-boxscore').innerHTML = '';
+
+  document.getElementById('leagueTitle').textContent = LEAGUE.leagueName || 'League Tracker';
+  document.getElementById('leagueMeta').textContent =
+    (LEAGUE.season || '') + ' Season · ' + Object.keys(TEAMS).length + ' Teams · Through Week ' + (LEAGUE.currentWeek || '?');
+
+  renderStandings();
+  renderMatchupsTab();
+}
+
 function buildWeeklyAndMatchups(data) {
   WEEKLY = {};
   MATCHUPS_BY_WEEK = {};
-  (data.schedule || []).forEach(m => {
+
+  const schedule = data.schedule || [];
+
+  // Detect whether ESPN's playoffTierType tagging is actually present in
+  // this data. If no matchup anywhere has a non-"NONE" tier, either the
+  // playoffs haven't happened yet or this API response doesn't carry the
+  // field -- either way, treat everything as regular season (unchanged
+  // behavior) rather than guessing.
+  const hasPlayoffData = schedule.some(m => m.playoffTierType && m.playoffTierType !== 'NONE');
+
+  // Diagnostic: log what playoffTierType values actually exist in this
+  // league's data, so a mismatch between what ESPN sends and what this app
+  // expects is visible immediately in the console instead of silently
+  // failing to filter/detect playoffs.
+  const tierTypesSeen = [...new Set(schedule.map(m => m.playoffTierType === undefined ? '(field missing)' : String(m.playoffTierType)))];
+  console.log('[playoff diagnostic] playoffTierType values found in schedule:', tierTypesSeen);
+  console.log('[playoff diagnostic] hasPlayoffData:', hasPlayoffData, '| total schedule entries:', schedule.length);
+
+  schedule.forEach(m => {
     const wk = m.matchupPeriodId;
     if (!wk) return;
     const home = m.home, away = m.away;
     if (!home) return;
     const homeDone = typeof home.totalPoints === 'number' && home.totalPoints > 0;
     const awayDone = away && typeof away.totalPoints === 'number' && away.totalPoints > 0;
+    const isRegularSeason = !hasPlayoffData || !m.playoffTierType || m.playoffTierType === 'NONE';
 
-    if (homeDone) {
-      WEEKLY[wk] = WEEKLY[wk] || [];
-      WEEKLY[wk].push({ teamId: home.teamId, points: home.totalPoints });
-    }
-    if (away && awayDone) {
-      WEEKLY[wk] = WEEKLY[wk] || [];
-      WEEKLY[wk].push({ teamId: away.teamId, points: away.totalPoints });
+    // WEEKLY feeds every standings-derived calculation (Median, What-If,
+    // Weekly High/Low Scorers, streaks, Position Breakdown, Roto Scoring)
+    // -- keep it regular-season-only so those totals match the same number
+    // of games as the Season Standings record ESPN reports.
+    if (isRegularSeason) {
+      if (homeDone) {
+        WEEKLY[wk] = WEEKLY[wk] || [];
+        WEEKLY[wk].push({ teamId: home.teamId, points: home.totalPoints });
+      }
+      if (away && awayDone) {
+        WEEKLY[wk] = WEEKLY[wk] || [];
+        WEEKLY[wk].push({ teamId: away.teamId, points: away.totalPoints });
+      }
     }
 
+    // MATCHUPS_BY_WEEK keeps EVERY week, including playoffs, so the
+    // Matchups/Box Score tabs and the Playoff Bracket tab can still browse
+    // and display those games.
     MATCHUPS_BY_WEEK[wk] = MATCHUPS_BY_WEEK[wk] || [];
     MATCHUPS_BY_WEEK[wk].push({
       homeId: home.teamId,
       awayId: away ? away.teamId : null,
       homeScore: home.totalPoints || 0,
       awayScore: away ? (away.totalPoints || 0) : null,
-      winner: m.winner
+      winner: m.winner,
+      playoffTierType: m.playoffTierType || 'NONE'
     });
   });
 }
@@ -471,7 +572,7 @@ function computeMoneyTracker(champCheckboxChecked) {
 function renderMoneyTable(champCheckboxChecked) {
   const rows = computeMoneyTracker(champCheckboxChecked);
   return `
-    <table>
+    <table class="narrow-table">
       <thead><tr><th></th><th>Team</th><th class="num">Weekly Wins</th><th class="num">🍺 Shotguns</th><th class="num">Money Won</th><th class="num">Buy-In Owed</th><th class="num">Net</th></tr></thead>
       <tbody>
         ${rows.map((t, i) => `
@@ -662,6 +763,164 @@ function benchPointsMap(standard, whatIf) {
   return map;
 }
 
+// Builds one flat, sortable row per team combining every standings table's
+// record plus the trend stats, for the Standings Comparison table.
+function computeStandingsComparisonRows(standard, med, whatIf, medianWhatIf, streaks, luck, efficiency, benchPts) {
+  const medById = {}; med.forEach(t => { medById[t.id] = t; });
+  const whatIfById = {}; whatIf.forEach(t => { whatIfById[t.id] = t; });
+  const medianWhatIfById = {}; medianWhatIf.forEach(t => { medianWhatIfById[t.id] = t; });
+
+  const recordStr = t => t ? `${t.wins}-${t.losses}${t.ties ? '-' + t.ties : ''}` : '—';
+
+  return standard.map(t => {
+    const m = medById[t.id], w = whatIfById[t.id], mw = medianWhatIfById[t.id];
+    const streak = streaks[t.id] || { label: '—', cls: '' };
+    let streakVal = 0;
+    if (streak.label && streak.label !== '—') {
+      const n = parseInt(streak.label.slice(1), 10) || 0;
+      streakVal = streak.label[0] === 'W' ? n : streak.label[0] === 'L' ? -n : 0;
+    }
+    return {
+      id: t.id,
+      name: t.name,
+      seasonWins: t.wins,
+      seasonRecord: recordStr(t),
+      medianWins: m ? m.wins : null,
+      medianRecord: recordStr(m),
+      whatIfWins: w ? w.wins : null,
+      whatIfRecord: recordStr(w),
+      medianWhatIfWins: mw ? mw.wins : null,
+      medianWhatIfRecord: recordStr(mw),
+      streakVal,
+      streakLabel: streak.label,
+      streakCls: streak.cls,
+      luck: luck[t.id] || 0,
+      efficiency: efficiency[t.id],
+      benchPts: benchPts[t.id]
+    };
+  });
+}
+
+let standingsComparisonRows = [];
+let standingsComparisonSort = { key: 'seasonWins', dir: 'desc' };
+
+function renderStandingsComparisonTable() {
+  const key = standingsComparisonSort.key;
+  const dir = standingsComparisonSort.dir;
+
+  const sorted = [...standingsComparisonRows].sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (av === null || av === undefined) av = dir === 'asc' ? Infinity : -Infinity;
+    if (bv === null || bv === undefined) bv = dir === 'asc' ? Infinity : -Infinity;
+    if (typeof av === 'string') return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return dir === 'asc' ? av - bv : bv - av;
+  });
+
+  const arrow = k => standingsComparisonSort.key === k ? (standingsComparisonSort.dir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
+  const col = (k, label) => `<th class="num sortable" onclick="setStandingsComparisonSort('${k}')">${label}${arrow(k)}</th>`;
+
+  const luckCellFn = v => {
+    const cls = v > 0 ? 'luck-pos' : v < 0 ? 'luck-neg' : 'luck-zero';
+    const label = v > 0 ? `+${v}` : `${v}`;
+    return `<span class="${cls}">${label}</span>`;
+  };
+
+  const wrap = document.getElementById('standingsComparisonTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th class="sortable" onclick="setStandingsComparisonSort('name')">Team${arrow('name')}</th>
+        ${col('seasonWins', 'Season')}
+        ${col('medianWins', 'Median')}
+        ${col('whatIfWins', 'What If')}
+        ${col('medianWhatIfWins', 'Median What If')}
+        ${col('streakVal', 'Win Streak')}
+        ${col('luck', 'Luck Index')}
+        ${col('efficiency', 'Manager Eff %')}
+        ${col('benchPts', 'Pts Left on Bench')}
+      </tr></thead>
+      <tbody>
+        ${sorted.map(t => `
+          <tr>
+            <td class="team">${t.name}</td>
+            <td class="num">${t.seasonRecord}</td>
+            <td class="num">${t.medianRecord}</td>
+            <td class="num">${t.whatIfRecord}</td>
+            <td class="num">${t.medianWhatIfRecord}</td>
+            <td class="num"><span class="${t.streakCls}">${t.streakLabel}</span></td>
+            <td class="num">${luckCellFn(t.luck)}</td>
+            <td class="num">${t.efficiency !== null && t.efficiency !== undefined ? t.efficiency.toFixed(1) + '%' : '—'}</td>
+            <td class="num">${t.benchPts !== undefined ? t.benchPts.toFixed(1) : '—'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    </div>
+  `;
+}
+
+function setStandingsComparisonSort(key) {
+  if (standingsComparisonSort.key === key) {
+    standingsComparisonSort.dir = standingsComparisonSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    standingsComparisonSort.key = key;
+    standingsComparisonSort.dir = key === 'name' ? 'asc' : 'desc';
+  }
+  renderStandingsComparisonTable();
+}
+
+let seasonStandingsRows = [];
+let seasonStandingsSort = { key: 'wins', dir: 'desc' };
+
+function renderSeasonStandingsTable() {
+  const key = seasonStandingsSort.key;
+  const dir = seasonStandingsSort.dir;
+
+  const sorted = [...seasonStandingsRows].sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (typeof av === 'string') return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return dir === 'asc' ? av - bv : bv - av;
+  });
+
+  const arrow = k => seasonStandingsSort.key === k ? (seasonStandingsSort.dir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
+  const col = (k, label) => `<th class="num sortable" onclick="setSeasonStandingsSort('${k}')">${label}${arrow(k)}</th>`;
+
+  const wrap = document.getElementById('seasonStandingsTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="narrow-table">
+      <thead><tr>
+        <th></th>
+        <th class="sortable" onclick="setSeasonStandingsSort('name')">Team${arrow('name')}</th>
+        ${col('wins', 'Record')}
+        ${col('pf', 'Points For')}
+        ${col('pa', 'Points Against')}
+      </tr></thead>
+      <tbody>
+        ${sorted.map((t, i) => `
+          <tr class="${i === 0 ? 'rank1' : ''}">
+            <td class="rank">${i + 1}</td>
+            <td class="team">${t.name}</td>
+            <td class="num">${t.record}</td>
+            <td class="num">${t.pf.toFixed(1)}</td>
+            <td class="num">${t.pa.toFixed(1)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function setSeasonStandingsSort(key) {
+  if (seasonStandingsSort.key === key) {
+    seasonStandingsSort.dir = seasonStandingsSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    seasonStandingsSort.key = key;
+    seasonStandingsSort.dir = key === 'name' ? 'asc' : 'desc';
+  }
+  renderSeasonStandingsTable();
+}
+
 function renderStandings() {
   const standard = computeStandardStandings();
   const med = computeMedianStandings();
@@ -670,14 +929,16 @@ function renderStandings() {
   const whatIf = computeWhatIfStandings();
   const medianWhatIf = computeMedianWhatIfStandings();
 
-  const standardRecords = recordMap(standard);
-  const medianRecords = recordMap(med);
-  const whatIfRecords = recordMap(whatIf);
-  const medianWhatIfRecords = recordMap(medianWhatIf);
   const streaks = streakMap();
   const luck = luckIndexMap(standard, med);
   const efficiency = efficiencyMap(standard, whatIf);
   const benchPts = benchPointsMap(standard, whatIf);
+  standingsComparisonRows = computeStandingsComparisonRows(standard, med, whatIf, medianWhatIf, streaks, luck, efficiency, benchPts);
+  seasonStandingsRows = standard.map(t => ({
+    id: t.id, name: t.name, wins: t.wins, losses: t.losses, ties: t.ties,
+    record: `${t.wins}-${t.losses}${t.ties ? '-' + t.ties : ''}`,
+    pf: t.pf, pa: t.pa
+  }));
 
   const rowHtml = (t, i, extraCol) => `
     <tr class="${i === 0 ? 'rank1' : ''}">
@@ -688,22 +949,22 @@ function renderStandings() {
       ${extraCol}
     </tr>`;
 
-  const luckCell = v => {
-    const cls = v > 0 ? 'luck-pos' : v < 0 ? 'luck-neg' : 'luck-zero';
-    const label = v > 0 ? `+${v}` : `${v}`;
-    return `<span class="${cls}">${label}</span>`;
-  };
+  const seasonToggleHtml = AVAILABLE_SEASONS.length > 0 ? `
+    <section class="block" style="margin-bottom:20px;">
+      <label style="display:flex; align-items:center; gap:10px; font-size:13px; color:var(--text-muted);">
+        Season
+        <select id="seasonToggle" style="background:var(--surface); border:1px solid var(--border); color:var(--text); padding:6px 10px; border-radius:6px; font-size:14px;">
+          ${AVAILABLE_SEASONS.map(s => `<option value="${s}" ${String(s) === String(CURRENT_SEASON) ? 'selected' : ''}>${s}</option>`).join('')}
+        </select>
+      </label>
+    </section>` : '';
 
   const html = `
+    ${seasonToggleHtml}
     <section class="block">
       <h2>Season Standings</h2>
-      <p class="sub">Actual head-to-head record</p>
-      <table>
-        <thead><tr><th></th><th>Team</th><th class="num">Record</th><th class="num">Points For</th><th class="num">Points Against</th></tr></thead>
-        <tbody>
-          ${standard.map((t, i) => rowHtml(t, i, `<td class="num">${t.pa.toFixed(1)}</td>`)).join('')}
-        </tbody>
-      </table>
+      <p class="sub">Actual head-to-head record. Click a column header to sort.</p>
+      <div id="seasonStandingsTableWrap"></div>
     </section>
     <section class="block">
       <h2>Weekly Extremes</h2>
@@ -711,7 +972,7 @@ function renderStandings() {
       <div class="compact-grid">
         <div>
           <div class="compact-label" style="color:var(--win);">Highest Scorer</div>
-          <table>
+          <table class="narrow-table">
             <thead><tr><th class="num">Week</th><th>Team</th><th class="num">Points</th></tr></thead>
             <tbody>
               ${highScores.map(h => `<tr><td class="num">${h.week}</td><td class="team">${h.name}</td><td class="num">${h.points.toFixed(1)}</td></tr>`).join('') || '<tr><td colspan="3" class="placeholder">No completed weeks yet.</td></tr>'}
@@ -720,7 +981,7 @@ function renderStandings() {
         </div>
         <div>
           <div class="compact-label" style="color:var(--loss);">Lowest Scorer</div>
-          <table>
+          <table class="narrow-table">
             <thead><tr><th class="num">Week</th><th>Team</th><th class="num">Points</th></tr></thead>
             <tbody>
               ${lowScores.map(h => `<tr><td class="num">${h.week}</td><td class="team">${h.name}</td><td class="num">${h.points.toFixed(1)}</td></tr>`).join('') || '<tr><td colspan="3" class="placeholder">No completed weeks yet.</td></tr>'}
@@ -731,40 +992,19 @@ function renderStandings() {
     </section>
     <section class="block">
       <h2>Standings Comparison</h2>
-      <p class="sub">Each team's record across every standings table, plus season-long trend stats</p>
+      <p class="sub">Each team's record across every standings table, plus season-long trend stats. Click a column header to sort.</p>
       <p class="sub">
         Win Streak reflects consecutive actual results, most recent first. Luck Index is actual wins minus median wins
         (positive = winning more than their scoring alone would predict). Manager Efficiency % is actual points scored
         ÷ optimal lineup points. Points Left on Bench is the season total of optimal minus actual scoring. All figures
-        only include completed weeks.
+        only include regular-season, completed weeks.
       </p>
-      <div class="table-scroll">
-      <table>
-        <thead><tr>
-          <th>Team</th><th class="num">Season</th><th class="num">Median</th><th class="num">What If</th><th class="num">Median What If</th>
-          <th class="num">Win Streak</th><th class="num">Luck Index</th><th class="num">Manager Eff %</th><th class="num">Pts Left on Bench</th>
-        </tr></thead>
-        <tbody>
-          ${standard.map(t => `
-            <tr>
-              <td class="team">${t.name}</td>
-              <td class="num">${standardRecords[t.id] || '—'}</td>
-              <td class="num">${medianRecords[t.id] || '—'}</td>
-              <td class="num">${whatIfRecords[t.id] || '—'}</td>
-              <td class="num">${medianWhatIfRecords[t.id] || '—'}</td>
-              <td class="num"><span class="${(streaks[t.id] || {}).cls || ''}">${(streaks[t.id] || {}).label || '—'}</span></td>
-              <td class="num">${luckCell(luck[t.id] || 0)}</td>
-              <td class="num">${efficiency[t.id] !== null && efficiency[t.id] !== undefined ? efficiency[t.id].toFixed(1) + '%' : '—'}</td>
-              <td class="num">${benchPts[t.id] !== undefined ? benchPts[t.id].toFixed(1) : '—'}</td>
-            </tr>`).join('')}
-        </tbody>
-      </table>
-      </div>
+      <div id="standingsComparisonTableWrap"></div>
     </section>
     <section class="block">
       <h2>Median Standings</h2>
       <p class="sub">Each week, scoring above the 12-team median counts as a win; below counts as a loss</p>
-      <table>
+      <table class="narrow-table">
         <thead><tr><th></th><th>Team</th><th class="num">Median Record</th><th class="num">Points For</th><th></th></tr></thead>
         <tbody>
           ${med.map((t, i) => rowHtml(t, i, `<td></td>`)).join('')}
@@ -774,7 +1014,7 @@ function renderStandings() {
     <section class="block">
       <h2>What-If Standings</h2>
       <p class="sub">Record if every team started their optimal lineup each week</p>
-      <table>
+      <table class="narrow-table">
         <thead><tr><th></th><th>Team</th><th class="num">What-If Record</th><th class="num">Optimal Points</th><th></th></tr></thead>
         <tbody>
           ${whatIf.map((t, i) => rowHtml(t, i, `<td></td>`)).join('') || '<tr><td colspan="4" class="placeholder">No box score data yet.</td></tr>'}
@@ -784,7 +1024,7 @@ function renderStandings() {
     <section class="block">
       <h2>Median What-If Standings</h2>
       <p class="sub">Each week, optimal-lineup score above the 12-team median (of optimal scores) counts as a win; below counts as a loss</p>
-      <table>
+      <table class="narrow-table">
         <thead><tr><th></th><th>Team</th><th class="num">Median What-If Record</th><th class="num">Optimal Points</th><th></th></tr></thead>
         <tbody>
           ${medianWhatIf.map((t, i) => rowHtml(t, i, `<td></td>`)).join('') || '<tr><td colspan="4" class="placeholder">No box score data yet.</td></tr>'}
@@ -805,6 +1045,15 @@ function renderStandings() {
     </section>
   `;
   document.getElementById('view-standings').innerHTML = html;
+  renderSeasonStandingsTable();
+  renderStandingsComparisonTable();
+
+  const seasonSel = document.getElementById('seasonToggle');
+  if (seasonSel) {
+    seasonSel.addEventListener('change', () => {
+      activateSeason(Number(seasonSel.value));
+    });
+  }
 
   const cb = document.getElementById('champToggle');
   if (cb) {
@@ -1327,6 +1576,762 @@ function setRotoScoringSort(key) {
   renderRotoScoringTable();
 }
 
+// ---------- Draft Recap tab ----------
+// Methodology: for each drafted player, compare where they were taken among
+// others at their position (Draft Position Rank -- e.g. "3rd RB off the
+// board") to how they finished the season in points among all drafted
+// players at that position (Finish Position Rank). Grade = Draft Rank minus
+// Finish Rank: positive means they outperformed their draft slot (steal),
+// negative means they underperformed it (bust). Points totals include bench
+// scoring -- this grades the pick itself, not how the manager used it.
+//
+// Data limitation: a player's season points are built by scanning every
+// week's box score data for that player's id. A player who was drafted,
+// then dropped and never picked up by anyone else the rest of the season,
+// will have an incomplete point total (we only see rostered players) and
+// is flagged as such rather than silently graded on partial data.
+
+let draftPlayerInfoCache = null;
+
+// Maps a raw player object's position fields (from the full player-pool
+// fetch, not a box score entry) to our QB/RB/WR/TE/K/DST groups -- same
+// convention as getPositionGroup(), just operating on plain fields instead
+// of a roster entry.
+function positionGroupFromRaw(defaultPositionId, eligibleSlots) {
+  if (Array.isArray(eligibleSlots) && eligibleSlots.length) {
+    if (eligibleSlots.includes(0)) return 'QB';
+    if (eligibleSlots.includes(2)) return 'RB';
+    if (eligibleSlots.includes(4)) return 'WR';
+    if (eligibleSlots.includes(6)) return 'TE';
+    if (eligibleSlots.includes(16)) return 'DST';
+    if (eligibleSlots.includes(17)) return 'K';
+  }
+  const map = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'DST' };
+  return map[defaultPositionId] || null;
+}
+
+// Fallback source: reconstructs each player's season total by scanning
+// every week's box score data for them. Only sees players while they're
+// actually on a roster somewhere -- a player who's dropped and never
+// picked up again for the rest of the season will show an incomplete
+// total here. Kept as a fallback for when the full player-pool fetch
+// (below) doesn't have an entry for someone.
+function buildBoxScorePlayerInfo() {
+  const info = {}; // playerId -> { name, pos, points }
+
+  const weeklyBox = (LEAGUE && LEAGUE.weeklyBoxscores) || {};
+  Object.entries(weeklyBox).forEach(([wk, matchups]) => {
+    const week = Number(wk);
+    if (!WEEKLY[week] || WEEKLY[week].length === 0) return; // only completed weeks
+    const real = (matchups || []).filter(m => m.matchupPeriodId === week);
+    real.forEach(m => {
+      [m.home, m.away].forEach(sideData => {
+        if (!sideData) return;
+        getRosterEntries(sideData).forEach(e => {
+          const player = getPlayer(e);
+          if (!player || player.id === undefined) return;
+          const pts = getPlayerPoints(e, week);
+          if (!info[player.id]) {
+            info[player.id] = { name: player.fullName || 'Unknown Player', pos: getPositionGroup(e), points: 0 };
+          }
+          if (pts !== null) info[player.id].points += pts;
+        });
+      });
+    });
+  });
+
+  return info;
+}
+
+// Preferred source: ESPN's full player-pool fetch (seasonPlayerStats in the
+// synced JSON) covers every rosterable player league-wide, including ones
+// nobody currently owns -- so a player who was dropped and never picked up
+// again still has a correct, complete season total here. This is what
+// solves the box-score method's blind spot. Falls back to the box-score
+// -derived value for any player missing from the pool fetch (e.g. an older
+// synced JSON that predates this feature, or a player the pool fetch
+// simply didn't return), so this never regresses below the old behavior.
+function buildDraftPlayerInfo() {
+  if (draftPlayerInfoCache) return draftPlayerInfoCache;
+
+  const boxScoreInfo = buildBoxScorePlayerInfo();
+  const seasonStats = (LEAGUE && LEAGUE.seasonPlayerStats) || {};
+
+  const info = {};
+  Object.entries(boxScoreInfo).forEach(([pid, v]) => {
+    info[pid] = { name: v.name, pos: v.pos, points: v.points, source: 'boxscore' };
+  });
+
+  Object.entries(seasonStats).forEach(([pid, v]) => {
+    if (v.points === null || v.points === undefined) return; // no usable total; keep box-score fallback
+    const existing = info[pid];
+    info[pid] = {
+      name: v.name || (existing && existing.name) || 'Unknown Player',
+      pos: positionGroupFromRaw(v.defaultPositionId, v.eligibleSlots) || (existing && existing.pos) || null,
+      points: v.points,
+      source: 'seasonPool'
+    };
+  });
+
+  draftPlayerInfoCache = info;
+  return info;
+}
+
+function computeDraftRecap() {
+  const picks = ((LEAGUE && LEAGUE.draftPicks) || []).slice();
+  if (picks.length === 0) return [];
+
+  const playerInfo = buildDraftPlayerInfo();
+  const teamsCount = Object.keys(TEAMS).length;
+
+  const enriched = picks.map(p => {
+    const overall = p.overallPickNumber || ((p.roundId - 1) * teamsCount + p.roundPickNumber);
+    const info = playerInfo[p.playerId];
+    return {
+      overall,
+      round: p.roundId,
+      roundPick: p.roundPickNumber,
+      teamId: p.teamId,
+      teamName: teamName(TEAMS[p.teamId]),
+      playerId: p.playerId,
+      playerName: info ? info.name : 'Unknown Player',
+      pos: info ? info.pos : null,
+      points: info ? info.points : null,
+      dataIncomplete: !info
+    };
+  }).sort((a, b) => a.overall - b.overall);
+
+  // Rank within each position: draft order (by overall pick) vs. finish (by points)
+  const posGroups = {};
+  enriched.forEach(p => {
+    if (!p.pos) return;
+    posGroups[p.pos] = posGroups[p.pos] || [];
+    posGroups[p.pos].push(p);
+  });
+
+  Object.entries(posGroups).forEach(([pos, group]) => {
+    const byDraft = [...group].sort((a, b) => a.overall - b.overall);
+    byDraft.forEach((p, i) => { p.draftPosRank = i + 1; });
+
+    const byFinish = [...group].sort((a, b) => (b.points || 0) - (a.points || 0));
+    byFinish.forEach((p, i) => { p.finishPosRank = i + 1; });
+  });
+
+  enriched.forEach(p => {
+    p.grade = (p.draftPosRank && p.finishPosRank) ? (p.draftPosRank - p.finishPosRank) : null;
+  });
+
+  // Weighted Grade: accounts for BOTH round drafted and the fact that raw
+  // points aren't comparable across positions (e.g. the best TE that year
+  // might score about the same raw points as a middling QB or WR, but that
+  // TE total is exceptional for the position while the QB/WR total is not).
+  //
+  // 1. Within each position, convert points to a z-score against that
+  //    position's own mean/stdev (drafted players only) -- this puts every
+  //    position on the same normalized scale.
+  // 2. Within each ROUND, average those z-scores across all positions to
+  //    get "what a pick in this round was expected to return."
+  // 3. Weighted Grade = player's z-score minus their round's expected
+  //    z-score. Positive = outperformed the bar for that round once
+  //    position scale is accounted for; negative = underperformed it.
+  Object.values(posGroups).forEach(group => {
+    const pts = group.map(p => p.points).filter(v => v !== null && v !== undefined);
+    if (pts.length === 0) return;
+    const mean = pts.reduce((a, b) => a + b, 0) / pts.length;
+    const variance = pts.length > 1
+      ? pts.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (pts.length - 1)
+      : 0;
+    const stdev = Math.sqrt(variance);
+    group.forEach(p => {
+      if (p.points === null || p.points === undefined) { p.zScore = null; return; }
+      p.zScore = stdev > 0 ? (p.points - mean) / stdev : 0;
+    });
+  });
+
+  const roundGroups = {};
+  enriched.forEach(p => {
+    if (p.zScore === null || p.zScore === undefined) return;
+    roundGroups[p.round] = roundGroups[p.round] || [];
+    roundGroups[p.round].push(p.zScore);
+  });
+  const roundExpectedZ = {};
+  Object.entries(roundGroups).forEach(([round, zScores]) => {
+    roundExpectedZ[round] = zScores.reduce((a, b) => a + b, 0) / zScores.length;
+  });
+
+  enriched.forEach(p => {
+    if (p.zScore === null || p.zScore === undefined || roundExpectedZ[p.round] === undefined) {
+      p.weightedGrade = null;
+    } else {
+      p.weightedGrade = p.zScore - roundExpectedZ[p.round];
+    }
+  });
+
+  return enriched;
+}
+
+let draftRecapSort = { key: 'overall', dir: 'asc' };
+let draftRecapFilters = { team: 'all', pos: 'all' };
+let draftRecapAllPicks = [];
+
+function renderDraftRecapTab() {
+  const container = document.getElementById('view-draftrecap');
+  const picks = computeDraftRecap();
+  draftRecapAllPicks = picks;
+
+  if (picks.length === 0) {
+    container.innerHTML = `
+      <section class="block">
+        <h2>Draft Recap</h2>
+        <p class="placeholder">No draft data found. Make sure the sync script has fetched this season's draft.</p>
+      </section>
+    `;
+    return;
+  }
+
+  const teamIds = Object.keys(TEAMS);
+  const positions = [...new Set(picks.map(p => p.pos).filter(Boolean))].sort();
+
+  container.innerHTML = `
+    <section class="block">
+      <h2>Draft Recap</h2>
+      <p class="sub">
+        Position Grade compares where a player was taken among others at their position (Draft Position Rank) to how
+        they finished the season in total points among all drafted players at that position (Finish Position Rank).
+        Positive = steal, negative = bust.
+      </p>
+      <p class="sub">
+        Weighted Grade accounts for round drafted and for positions scoring on very different scales -- e.g. the
+        best TE in a season might score about the same raw points as a middling QB or WR, but that total is
+        exceptional for a TE and unremarkable for a QB. Each player's points are converted to a z-score against
+        others at their own position, then compared to the average z-score of everyone taken in that same round.
+        Positive = beat the bar for that round once position scale is accounted for; negative = fell short of it.
+      </p>
+      <p class="sub">
+        Both use total season points including bench scoring, since this grades the pick itself, not how it was
+        managed. Season totals come from ESPN's full player pool, so they're accurate even for players who were
+        dropped and never picked up again; a pick is only marked "incomplete" in the rare case that data isn't
+        available either. Click a column header to sort.
+      </p>
+      <div class="filter-row">
+        <select id="draftRecapTeamFilter">
+          <option value="all">All Teams</option>
+          ${teamIds.map(id => `<option value="${id}">${teamName(TEAMS[id])}</option>`).join('')}
+        </select>
+        <select id="draftRecapPosFilter">
+          <option value="all">All Positions</option>
+          ${positions.map(p => `<option value="${p}">${p}</option>`).join('')}
+        </select>
+      </div>
+      <div id="draftRecapTableWrap"></div>
+    </section>
+  `;
+
+  const teamSel = document.getElementById('draftRecapTeamFilter');
+  const posSel = document.getElementById('draftRecapPosFilter');
+  teamSel.value = draftRecapFilters.team;
+  posSel.value = draftRecapFilters.pos;
+  teamSel.addEventListener('change', () => {
+    draftRecapFilters.team = teamSel.value;
+    renderDraftRecapTable(applyDraftRecapFilters(draftRecapAllPicks));
+  });
+  posSel.addEventListener('change', () => {
+    draftRecapFilters.pos = posSel.value;
+    renderDraftRecapTable(applyDraftRecapFilters(draftRecapAllPicks));
+  });
+
+  renderDraftRecapTable(applyDraftRecapFilters(picks));
+}
+
+function applyDraftRecapFilters(picks) {
+  return picks.filter(p => {
+    if (draftRecapFilters.team !== 'all' && String(p.teamId) !== String(draftRecapFilters.team)) return false;
+    if (draftRecapFilters.pos !== 'all' && p.pos !== draftRecapFilters.pos) return false;
+    return true;
+  });
+}
+
+function renderDraftRecapTable(picks) {
+  const key = draftRecapSort.key;
+  const dir = draftRecapSort.dir;
+
+  const sorted = [...picks].sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (av === null || av === undefined) av = dir === 'asc' ? Infinity : -Infinity;
+    if (bv === null || bv === undefined) bv = dir === 'asc' ? Infinity : -Infinity;
+    if (typeof av === 'string') return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return dir === 'asc' ? av - bv : bv - av;
+  });
+
+  const arrow = k => draftRecapSort.key === k ? (draftRecapSort.dir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
+  const col = (k, label) => `<th class="num sortable" onclick="setDraftRecapSort('${k}')">${label}${arrow(k)}</th>`;
+
+  const wrap = document.getElementById('draftRecapTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div class="table-scroll">
+    <table class="tight-table">
+      <thead><tr>
+        ${col('round', 'Rd')}
+        ${col('overall', 'Pick')}
+        <th class="sortable" onclick="setDraftRecapSort('teamName')">Team${arrow('teamName')}</th>
+        <th class="sortable" onclick="setDraftRecapSort('playerName')">Player${arrow('playerName')}</th>
+        <th class="sortable" onclick="setDraftRecapSort('pos')">Pos${arrow('pos')}</th>
+        ${col('points', 'Points')}
+        ${col('draftPosRank', 'Draft Rank')}
+        ${col('finishPosRank', 'Finish Rank')}
+        ${col('grade', 'Position Grade')}
+        ${col('weightedGrade', 'Weighted Grade')}
+      </tr></thead>
+      <tbody>
+        ${sorted.map(p => {
+          const gradeColor = p.grade === null ? 'var(--text-muted)' : p.grade > 0 ? 'var(--win)' : p.grade < 0 ? 'var(--loss)' : 'var(--text-muted)';
+          const gradeLabel = p.grade === null ? '—' : (p.grade > 0 ? `+${p.grade}` : `${p.grade}`);
+          const wg = p.weightedGrade;
+          const wgColor = wg === null || wg === undefined ? 'var(--text-muted)' : wg > 0 ? 'var(--win)' : wg < 0 ? 'var(--loss)' : 'var(--text-muted)';
+          const wgLabel = wg === null || wg === undefined ? '—' : (wg > 0 ? `+${wg.toFixed(2)}` : wg.toFixed(2));
+          return `
+          <tr>
+            <td class="num">${p.round}</td>
+            <td class="num">${p.overall}</td>
+            <td class="team">${p.teamName}</td>
+            <td>${p.playerName}${p.dataIncomplete ? ' <span style="color:var(--text-muted); font-size:11px;">(incomplete)</span>' : ''}</td>
+            <td class="num">${p.pos || '—'}</td>
+            <td class="num">${p.points !== null ? p.points.toFixed(1) : '—'}</td>
+            <td class="num">${p.draftPosRank ? p.pos + p.draftPosRank : '—'}</td>
+            <td class="num">${p.finishPosRank ? p.pos + p.finishPosRank : '—'}</td>
+            <td class="num" style="color:${gradeColor}; font-weight:700;">${gradeLabel}</td>
+            <td class="num" style="color:${wgColor}; font-weight:700;">${wgLabel}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="10" class="placeholder">No picks match this filter.</td></tr>'}
+      </tbody>
+    </table>
+    </div>
+  `;
+}
+
+function setDraftRecapSort(key) {
+  if (draftRecapSort.key === key) {
+    draftRecapSort.dir = draftRecapSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    draftRecapSort.key = key;
+    draftRecapSort.dir = (key === 'teamName' || key === 'playerName' || key === 'pos') ? 'asc' : 'desc';
+  }
+  renderDraftRecapTable(applyDraftRecapFilters(draftRecapAllPicks));
+}
+
+// ---------- Waivers tab ----------
+// Player names/positions for transactions are resolved from the same merged
+// lookup Draft Recap already builds (buildDraftPlayerInfo): preferring
+// ESPN's full player-pool data, falling back to box-score-derived info.
+function getPlayerNamePos(playerId) {
+  const info = buildDraftPlayerInfo();
+  const entry = info[playerId];
+  return entry ? { name: entry.name, pos: entry.pos } : { name: 'Unknown Player', pos: null };
+}
+
+function memberDisplayName(ownerGuid) {
+  const members = (LEAGUE && LEAGUE.members) || [];
+  const m = members.find(x => x.id === ownerGuid);
+  if (!m) return null;
+  return m.displayName || [m.firstName, m.lastName].filter(Boolean).join(' ') || null;
+}
+
+function teamManagerName(team) {
+  if (!team || !Array.isArray(team.owners) || team.owners.length === 0) return '—';
+  const names = team.owners.map(memberDisplayName).filter(Boolean);
+  return names.length ? names.join(', ') : '—';
+}
+
+// "Moved" = ESPN's ROSTER transaction type (IR slot moves, lineup drag/drop
+// logged as transactions) -- not an actual add/drop/trade. Excluded by
+// default, matching ESPN's own "All, Except Moved" default filter.
+function isMovedTransaction(t) {
+  return t.type === 'ROSTER';
+}
+
+function transactionTypeLabel(t) {
+  if (t.type === 'WAIVER') return 'Waiver';
+  if (t.type === 'FREEAGENT') return 'Free Agent';
+  if (t.type === 'TRADE') return 'Trade';
+  if (t.type === 'ROSTER') return 'Moved';
+  return t.type || 'Other';
+}
+
+function formatTransactionDetail(t) {
+  const teamNm = teamName(TEAMS[t.teamId]);
+  const lines = [];
+  (t.items || []).forEach(item => {
+    const { name, pos } = getPlayerNamePos(item.playerId);
+    const posLabel = pos ? `, ${pos}` : '';
+    if (item.type === 'ADD' || item.type === 'WAIVER_ADD' || item.type === 'FREEAGENT_ADD') {
+      const source = t.type === 'WAIVER' ? 'Waivers' : 'Free Agency';
+      const bid = (typeof t.bidAmount === 'number') ? ` for $${t.bidAmount}` : '';
+      lines.push(`${teamNm} added ${name}${posLabel} from ${source}${bid}`);
+    } else if (item.type === 'DROP') {
+      lines.push(`${teamNm} dropped ${name}${posLabel} to Waivers`);
+    } else if (item.type && item.type.indexOf('TRADE') !== -1) {
+      const fromTm = teamName(TEAMS[item.fromTeamId]);
+      const toTm = teamName(TEAMS[item.toTeamId]);
+      lines.push(`${fromTm} traded ${name}${posLabel} to ${toTm}`);
+    } else {
+      lines.push(`${teamNm} moved ${name}${posLabel}`);
+    }
+  });
+  return lines.join('<br>') || '—';
+}
+
+function txnDateMs(t) {
+  return typeof t.date === 'number' ? t.date : null;
+}
+
+let waiverActivityFilters = { activityType: 'all', startDate: '', endDate: '', team: 'all', transactions: 'except_moved' };
+
+function applyActivityFilters(transactions) {
+  return transactions.filter(t => {
+    if (waiverActivityFilters.transactions === 'except_moved' && isMovedTransaction(t)) return false;
+    if (waiverActivityFilters.activityType !== 'all' && transactionTypeLabel(t) !== waiverActivityFilters.activityType) return false;
+    if (waiverActivityFilters.team !== 'all' && String(t.teamId) !== String(waiverActivityFilters.team)) return false;
+    const ms = txnDateMs(t);
+    if (waiverActivityFilters.startDate && ms !== null) {
+      if (ms < new Date(waiverActivityFilters.startDate + 'T00:00:00').getTime()) return false;
+    }
+    if (waiverActivityFilters.endDate && ms !== null) {
+      if (ms > new Date(waiverActivityFilters.endDate + 'T23:59:59').getTime()) return false;
+    }
+    return true;
+  });
+}
+
+function renderRecentActivityTable() {
+  const all = (LEAGUE && LEAGUE.transactions) || [];
+  const filtered = applyActivityFilters(all).slice().sort((a, b) => (txnDateMs(b) || 0) - (txnDateMs(a) || 0));
+
+  const wrap = document.getElementById('recentActivityTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th>Date</th><th>Type</th><th>Detail</th><th>Team</th></tr></thead>
+      <tbody>
+        ${filtered.map(t => {
+          const ms = txnDateMs(t);
+          const dateStr = ms ? new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+          return `<tr>
+            <td>${dateStr}</td>
+            <td>${transactionTypeLabel(t)}</td>
+            <td>${formatTransactionDetail(t)}</td>
+            <td class="team">${teamName(TEAMS[t.teamId])}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="4" class="placeholder">No transactions match this filter.</td></tr>'}
+      </tbody>
+    </table>
+    </div>
+  `;
+}
+
+function computeFreeAgentOfferDates() {
+  const all = (LEAGUE && LEAGUE.transactions) || [];
+  const waiverTxns = all.filter(t => t.type === 'WAIVER' && txnDateMs(t) !== null);
+  const dayKeys = new Set(waiverTxns.map(t => new Date(txnDateMs(t)).toISOString().slice(0, 10)));
+  return [...dayKeys].sort((a, b) => b.localeCompare(a));
+}
+
+let faOfferDateFilter = null;
+
+// ESPN generates its own human-readable failure message (e.g. "Player has
+// already been added to another team") that the API doesn't expose --
+// only a status code. This maps the common codes to equivalent wording;
+// anything not in the map falls back to a cleaned-up version of the code
+// itself rather than a guess.
+const WAIVER_FAILURE_REASONS = {
+  FAILED_INVALIDPLAYERSOURCE: 'Player has already been added to another team.',
+  FAILED_ROSTER_INVALID: 'Roster would be invalid with this move.',
+  FAILED_BUDGET: 'Bid exceeded available FAAB budget.',
+  FAILED_ONTEAM: 'Player is already on this team.',
+  CANCELLED: 'Claim was cancelled.',
+  CANCELED: 'Claim was cancelled.'
+};
+
+function waiverFailureReason(status) {
+  if (!status) return 'Unknown reason.';
+  if (WAIVER_FAILURE_REASONS[status]) return WAIVER_FAILURE_REASONS[status];
+  return status.replace(/^FAILED_/, '').replace(/_/g, ' ').toLowerCase().replace(/^./, c => c.toUpperCase()) + '.';
+}
+
+function renderFreeAgentOffersReport() {
+  const all = (LEAGUE && LEAGUE.transactions) || [];
+  const dates = computeFreeAgentOfferDates();
+  if (!faOfferDateFilter || !dates.includes(faOfferDateFilter)) {
+    faOfferDateFilter = dates[0] || null;
+  }
+
+  const wrap = document.getElementById('faOffersTableWrap');
+  if (!wrap) return;
+
+  if (!faOfferDateFilter) {
+    wrap.innerHTML = '<p class="placeholder">No waiver processing dates found yet.</p>';
+    return;
+  }
+
+  const dayTxns = all.filter(t => {
+    if (t.type !== 'WAIVER' || txnDateMs(t) === null) return false;
+    return new Date(txnDateMs(t)).toISOString().slice(0, 10) === faOfferDateFilter;
+  });
+
+  const rows = dayTxns.map(t => {
+    const addItem = (t.items || []).find(i => i.type === 'ADD' || i.type === 'WAIVER_ADD');
+    const dropItem = (t.items || []).find(i => i.type === 'DROP');
+    const claim = addItem ? getPlayerNamePos(addItem.playerId) : { name: '—', pos: null };
+    const successful = t.status === 'EXECUTED';
+    let results;
+    if (successful) {
+      const dropInfo = dropItem ? getPlayerNamePos(dropItem.playerId) : null;
+      results = dropInfo
+        ? `Added. ${teamName(TEAMS[t.teamId])} dropped <strong>${dropInfo.name}</strong>${dropInfo.pos ? ', ' + dropInfo.pos : ''} to Waivers.`
+        : 'Added.';
+    } else {
+      results = `Unsuccessful. Reason: ${waiverFailureReason(t.status)}`;
+    }
+    return {
+      team: teamName(TEAMS[t.teamId]),
+      claim: `<strong>${claim.name}</strong>${claim.pos ? ', ' + claim.pos : ''}`,
+      offer: (typeof t.bidAmount === 'number') ? `$${t.bidAmount}` : '—',
+      results,
+      successful
+    };
+  });
+
+  wrap.innerHTML = `
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th class="num">Pos</th><th>Team</th><th>Claim</th><th class="num">Offer</th><th>Results</th></tr></thead>
+      <tbody>
+        ${rows.map((r, i) => `
+          <tr>
+            <td class="num">${i + 1}</td>
+            <td class="team">${r.team}</td>
+            <td>${r.claim}</td>
+            <td class="num">${r.offer}</td>
+            <td>${r.results}</td>
+          </tr>`).join('') || '<tr><td colspan="5" class="placeholder">No offers processed this date.</td></tr>'}
+      </tbody>
+    </table>
+    </div>
+  `;
+}
+
+function computeFaabBudgets() {
+  const total = LEAGUE && LEAGUE.faabTotalBudget;
+  return Object.values(TEAMS).map(t => {
+    const spent = (t.transactionCounter && t.transactionCounter.acquisitionBudgetSpent) || 0;
+    const remaining = (total !== null && total !== undefined) ? (total - spent) : null;
+    return { id: t.id, name: teamName(t), manager: teamManagerName(t), spent, remaining };
+  }).sort((a, b) => (b.remaining ?? -Infinity) - (a.remaining ?? -Infinity));
+}
+
+function renderFaabBudgetTable() {
+  const rows = computeFaabBudgets();
+  const wrap = document.getElementById('faabBudgetTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <table class="narrow-table">
+      <thead><tr><th class="num">Pos</th><th>Team</th><th class="num">Budget</th></tr></thead>
+      <tbody>
+        ${rows.map((r, i) => `
+          <tr class="${i === 0 ? 'rank1' : ''}">
+            <td class="num">${i + 1}</td>
+            <td class="team">${r.name}</td>
+            <td class="num">${r.remaining !== null ? '$' + r.remaining : '—'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderWaiversTab() {
+  const container = document.getElementById('view-waivers');
+  const teamIds = Object.keys(TEAMS);
+  const all = (LEAGUE && LEAGUE.transactions) || [];
+  const activityTypes = [...new Set(all.map(transactionTypeLabel))].sort();
+  const offerDates = computeFreeAgentOfferDates();
+  if (!faOfferDateFilter || !offerDates.includes(faOfferDateFilter)) {
+    faOfferDateFilter = offerDates[0] || null;
+  }
+
+  container.innerHTML = `
+    <section class="block">
+      <h2>Recent Activity</h2>
+      <p class="sub">All roster transactions -- defaults to excluding "Moved" (IR/roster slot moves), matching ESPN's own default filter.</p>
+      <div class="filter-row">
+        <label>Activity Type
+          <select id="waiverActivityType">
+            <option value="all">All</option>
+            ${activityTypes.map(a => `<option value="${a}">${a}</option>`).join('')}
+          </select>
+        </label>
+        <label>Start Date
+          <input type="date" id="waiverStartDate">
+        </label>
+        <label>End Date
+          <input type="date" id="waiverEndDate">
+        </label>
+        <label>Team
+          <select id="waiverTeamFilter">
+            <option value="all">All</option>
+            ${teamIds.map(id => `<option value="${id}">${teamName(TEAMS[id])}</option>`).join('')}
+          </select>
+        </label>
+        <label>Transactions
+          <select id="waiverTxnFilter">
+            <option value="except_moved">All, Except Moved</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+      </div>
+      <div id="recentActivityTableWrap"></div>
+    </section>
+    <section class="block">
+      <h2>Free Agent Offers Report</h2>
+      <p class="sub">Waiver claims processed on a given date</p>
+      <div class="filter-row">
+        <label>View Date
+          <select id="faOfferDate">
+            ${offerDates.map(d => `<option value="${d}" ${d === faOfferDateFilter ? 'selected' : ''}>${new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}</option>`).join('') || '<option value="">No dates available</option>'}
+          </select>
+        </label>
+      </div>
+      <div id="faOffersTableWrap"></div>
+    </section>
+    <section class="block">
+      <h2>Free Agent Budget Summary</h2>
+      <p class="sub">Remaining FAAB budget per team${LEAGUE && LEAGUE.faabTotalBudget ? ` (of $${LEAGUE.faabTotalBudget} total)` : ''}</p>
+      <div id="faabBudgetTableWrap"></div>
+    </section>
+  `;
+
+  const typeSel = document.getElementById('waiverActivityType');
+  const startInput = document.getElementById('waiverStartDate');
+  const endInput = document.getElementById('waiverEndDate');
+  const teamSel = document.getElementById('waiverTeamFilter');
+  const txnSel = document.getElementById('waiverTxnFilter');
+
+  typeSel.value = waiverActivityFilters.activityType;
+  startInput.value = waiverActivityFilters.startDate;
+  endInput.value = waiverActivityFilters.endDate;
+  teamSel.value = waiverActivityFilters.team;
+  txnSel.value = waiverActivityFilters.transactions;
+
+  [
+    [typeSel, 'activityType'], [startInput, 'startDate'], [endInput, 'endDate'],
+    [teamSel, 'team'], [txnSel, 'transactions']
+  ].forEach(([el, key]) => {
+    el.addEventListener('change', () => {
+      waiverActivityFilters[key] = el.value;
+      renderRecentActivityTable();
+    });
+  });
+
+  const dateSel = document.getElementById('faOfferDate');
+  if (dateSel) {
+    dateSel.addEventListener('change', () => {
+      faOfferDateFilter = dateSel.value;
+      renderFreeAgentOffersReport();
+    });
+  }
+
+  renderRecentActivityTable();
+  renderFreeAgentOffersReport();
+  renderFaabBudgetTable();
+}
+
+// ---------- Playoff Bracket tab ----------
+// Reads directly from LEAGUE.schedule (every week, unfiltered) rather than
+// the regular-season-only WEEKLY -- playoff games are exactly what this tab
+// needs to show. Splits into the winners bracket (playoffTierType
+// "WINNERS_BRACKET") and a consolation bracket (any tier type starting with
+// "LOSERS"), then groups each into rounds by matchupPeriodId.
+function computePlayoffBrackets() {
+  const schedule = (LEAGUE && LEAGUE.schedule) || [];
+  const playoffMatchups = schedule.filter(m => m.playoffTierType && m.playoffTierType !== 'NONE');
+
+  const winners = playoffMatchups.filter(m => m.playoffTierType === 'WINNERS_BRACKET');
+  const consolation = playoffMatchups.filter(m => (m.playoffTierType || '').startsWith('LOSERS'));
+
+  function groupByRound(matchups) {
+    const byWeek = {};
+    matchups.forEach(m => {
+      byWeek[m.matchupPeriodId] = byWeek[m.matchupPeriodId] || [];
+      byWeek[m.matchupPeriodId].push(m);
+    });
+    return Object.keys(byWeek).map(Number).sort((a, b) => a - b).map(week => ({ week, matchups: byWeek[week] }));
+  }
+
+  return { winners: groupByRound(winners), consolation: groupByRound(consolation) };
+}
+
+function renderBracketRound(roundData, index, totalRounds, isFinalLabel) {
+  const label = index === totalRounds - 1 ? isFinalLabel : `Round ${index + 1}`;
+  const cards = roundData.matchups.map(m => {
+    const home = TEAMS[m.home.teamId];
+    const away = m.away ? TEAMS[m.away.teamId] : null;
+    const homeScore = m.home.totalPoints || 0;
+    const awayScore = m.away ? (m.away.totalPoints || 0) : null;
+    const homeWin = m.winner === 'HOME' || (m.winner !== 'AWAY' && awayScore !== null && homeScore > awayScore);
+    const awayWin = m.winner === 'AWAY' || (m.winner !== 'HOME' && awayScore !== null && awayScore > homeScore);
+    return `
+      <div class="matchup-card" style="cursor:default;">
+        <div class="side home ${homeWin ? 'winner' : ''}">
+          <div class="name">${teamName(home)}</div>
+          <div class="score">${homeScore.toFixed(1)}</div>
+        </div>
+        <div class="vs">WK ${roundData.week}</div>
+        <div class="side away ${awayWin ? 'winner' : ''}">
+          <div class="name">${away ? teamName(away) : 'BYE'}</div>
+          <div class="score">${awayScore !== null ? awayScore.toFixed(1) : '—'}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="bracket-round">
+      <h3 class="bracket-round-label">${label}</h3>
+      <div class="matchup-grid">${cards}</div>
+    </div>`;
+}
+
+function renderPlayoffBracketTab() {
+  const container = document.getElementById('view-playoffs');
+  const { winners, consolation } = computePlayoffBrackets();
+
+  if (winners.length === 0 && consolation.length === 0) {
+    container.innerHTML = `
+      <section class="block">
+        <h2>Playoff Bracket</h2>
+        <p class="placeholder">No playoff matchups yet. This fills in automatically once the playoff weeks are underway.</p>
+      </section>
+    `;
+    return;
+  }
+
+  container.innerHTML = `
+    <section class="block">
+      <h2>Playoff Bracket</h2>
+      <p class="sub">The championship bracket</p>
+      ${winners.length
+        ? winners.map((r, i) => renderBracketRound(r, i, winners.length, 'Championship')).join('')
+        : '<p class="placeholder">No winners bracket data yet.</p>'}
+    </section>
+    <section class="block">
+      <h2>Consolation Bracket</h2>
+      <p class="sub">For teams that missed the championship bracket</p>
+      ${consolation.length
+        ? consolation.map((r, i) => renderBracketRound(r, i, consolation.length, 'Consolation Final')).join('')
+        : '<p class="placeholder">No consolation bracket data yet.</p>'}
+    </section>
+  `;
+}
+
 
 function renderWeeklyScoringTable() {
   const { weeks, rows } = computeWeeklyScoringTable();
@@ -1384,6 +2389,9 @@ document.querySelectorAll('nav.tabs button').forEach(btn => {
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById('view-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'teamcompare') renderTeamComparisonTab();
+    if (btn.dataset.tab === 'draftrecap') renderDraftRecapTab();
+    if (btn.dataset.tab === 'waivers') renderWaiversTab();
+    if (btn.dataset.tab === 'playoffs') renderPlayoffBracketTab();
   });
 });
 </script>
